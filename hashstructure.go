@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"hash"
 	"hash/fnv"
+	"math"
 	"reflect"
+	"unsafe"
 )
 
 // ErrNotStringer is returned when there's an error with hash:"string"
@@ -86,7 +88,7 @@ func Hash(v interface{}, opts *HashOptions) (uint64, error) {
 		tag:     opts.TagName,
 		zeronil: opts.ZeroNil,
 	}
-	return w.visit(reflect.ValueOf(v), nil)
+	return w.visit(reflect.ValueOf(v), visitOpts{})
 }
 
 type walker struct {
@@ -104,7 +106,7 @@ type visitOpts struct {
 	StructField string
 }
 
-func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
+func (w *walker) visit(v reflect.Value, opts visitOpts) (uint64, error) {
 	t := reflect.TypeOf(0)
 
 	// Loop since these can be wrapped in multiple layers of pointers
@@ -134,29 +136,12 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		v = reflect.Zero(t)
 	}
 
-	// Binary writing can use raw ints, we have to convert to
-	// a sized-int, we'll choose the largest...
-	switch v.Kind() {
-	case reflect.Int:
-		v = reflect.ValueOf(int64(v.Int()))
-	case reflect.Uint:
-		v = reflect.ValueOf(uint64(v.Uint()))
-	case reflect.Bool:
-		var tmp int8
-		if v.Bool() {
-			tmp = 1
-		}
-		v = reflect.ValueOf(tmp)
-	}
-
 	k := v.Kind()
 
 	// We can shortcut numeric values by directly binary writing them
-	if k >= reflect.Int && k <= reflect.Complex64 {
+	if k >= reflect.Bool && k <= reflect.Complex64 {
 		// A direct hash calculation
-		w.h.Reset()
-		err := binary.Write(w.h, binary.LittleEndian, v.Interface())
-		return w.h.Sum64(), err
+		return hashNumber(w.h, v.Interface()), nil
 	}
 
 	switch k {
@@ -164,7 +149,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		var h uint64
 		l := v.Len()
 		for i := 0; i < l; i++ {
-			current, err := w.visit(v.Index(i), nil)
+			current, err := w.visit(v.Index(i), visitOpts{})
 			if err != nil {
 				return 0, err
 			}
@@ -176,7 +161,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 
 	case reflect.Map:
 		var includeMap IncludableMap
-		if opts != nil && opts.Struct != nil {
+		if opts.Struct != nil {
 			if v, ok := opts.Struct.(IncludableMap); ok {
 				includeMap = v
 			}
@@ -198,11 +183,11 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 				}
 			}
 
-			kh, err := w.visit(k, nil)
+			kh, err := w.visit(k, visitOpts{})
 			if err != nil {
 				return 0, err
 			}
-			vh, err := w.visit(v, nil)
+			vh, err := w.visit(v, visitOpts{})
 			if err != nil {
 				return 0, err
 			}
@@ -221,7 +206,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		}
 
 		t := v.Type()
-		h, err := w.visit(reflect.ValueOf(t.Name()), nil)
+		h, err := w.visit(reflect.ValueOf(t.Name()), visitOpts{})
 		if err != nil {
 			return 0, err
 		}
@@ -269,12 +254,12 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 					f |= visitFlagSet
 				}
 
-				kh, err := w.visit(reflect.ValueOf(fieldType.Name), nil)
+				kh, err := w.visit(reflect.ValueOf(fieldType.Name), visitOpts{})
 				if err != nil {
 					return 0, err
 				}
 
-				vh, err := w.visit(innerV, &visitOpts{
+				vh, err := w.visit(innerV, visitOpts{
 					Flags:       f,
 					Struct:      parent,
 					StructField: fieldType.Name,
@@ -295,13 +280,10 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		// visit all the elements. If it is a set, then we do a deterministic
 		// hash code.
 		var h uint64
-		var set bool
-		if opts != nil {
-			set = (opts.Flags & visitFlagSet) != 0
-		}
+		set := (opts.Flags & visitFlagSet) != 0
 		l := v.Len()
 		for i := 0; i < l; i++ {
-			current, err := w.visit(v.Index(i), nil)
+			current, err := w.visit(v.Index(i), visitOpts{})
 			if err != nil {
 				return 0, err
 			}
@@ -318,7 +300,9 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 	case reflect.String:
 		// Directly hash
 		w.h.Reset()
-		_, err := w.h.Write([]byte(v.String()))
+		s := v.String()
+		// avoid allocating a new byte slice for the string
+		_, err := w.h.Write(*(*[]byte)(unsafe.Pointer(&s)))
 		return w.h.Sum64(), err
 
 	default:
@@ -330,18 +314,10 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 func hashUpdateOrdered(h hash.Hash64, a, b uint64) uint64 {
 	// For ordered updates, use a real hash function
 	h.Reset()
-
-	// We just panic if the binary writes fail because we are writing
-	// an int64 which should never be fail-able.
-	e1 := binary.Write(h, binary.LittleEndian, a)
-	e2 := binary.Write(h, binary.LittleEndian, b)
-	if e1 != nil {
-		panic(e1)
-	}
-	if e2 != nil {
-		panic(e2)
-	}
-
+	_, _ = h.Write([]byte{
+		byte(a), byte(a >> 8), byte(a >> 16), byte(a >> 24), byte(a >> 32), byte(a >> 40), byte(a >> 48), byte(a >> 56),
+		byte(b), byte(b >> 8), byte(b >> 16), byte(b >> 24), byte(b >> 32), byte(b >> 40), byte(b >> 48), byte(b >> 56),
+	})
 	return h.Sum64()
 }
 
@@ -349,10 +325,80 @@ func hashUpdateUnordered(a, b uint64) uint64 {
 	return a ^ b
 }
 
+func hashNumber(h hash.Hash64, i interface{}) uint64 {
+	switch data := i.(type) {
+	case bool:
+		if data {
+			return hash8(h, uint8(1))
+		}
+		return hash8(h, uint8(0))
+	case int8:
+		return hash8(h, uint8(data))
+	case uint8:
+		return hash8(h, data)
+
+	case int16:
+		return hash16(h, uint16(data))
+	case uint16:
+		return hash16(h, data)
+
+	case int32:
+		return hash32(h, uint32(data))
+	case uint32:
+		return hash32(h, data)
+	case float32:
+		return hash32(h, math.Float32bits(data))
+
+	case int:
+		return hash64(h, uint64(data))
+	case int64:
+		return hash64(h, uint64(data))
+	case uint:
+		return hash64(h, uint64(data))
+	case uint64:
+		return hash64(h, data)
+	case uintptr:
+		return hash64(h, uint64(data))
+	case float64:
+		return hash64(h, math.Float64bits(data))
+	case complex64:
+		return hash64(h, *(*uint64)(unsafe.Pointer(&data)))
+
+	default:
+		h.Reset()
+		_ = binary.Write(h, binary.LittleEndian, i)
+		return h.Sum64()
+	}
+}
+
+func hash8(h hash.Hash64, i uint8) uint64 {
+	h.Reset()
+	_, _ = h.Write([]byte{i})
+	return h.Sum64()
+}
+
+func hash16(h hash.Hash64, i uint16) uint64 {
+	h.Reset()
+	_, _ = h.Write([]byte{byte(i), byte(i >> 8)})
+	return h.Sum64()
+}
+
+func hash32(h hash.Hash64, i uint32) uint64 {
+	h.Reset()
+	_, _ = h.Write([]byte{byte(i), byte(i >> 8), byte(i >> 16), byte(i >> 24)})
+	return h.Sum64()
+}
+
+func hash64(h hash.Hash64, i uint64) uint64 {
+	h.Reset()
+	_, _ = h.Write([]byte{byte(i), byte(i >> 8), byte(i >> 16), byte(i >> 24), byte(i >> 32), byte(i >> 40), byte(i >> 48), byte(i >> 56)})
+	return h.Sum64()
+}
+
 // visitFlag is used as a bitmask for affecting visit behavior
 type visitFlag uint
 
 const (
-	visitFlagInvalid visitFlag = iota
-	visitFlagSet               = iota << 1
+	_            visitFlag = iota
+	visitFlagSet           = iota << 1
 )
